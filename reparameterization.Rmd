@@ -1,0 +1,381 @@
+---
+title: "The problem of precision in centered vs. non-centered reparameterizations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(cmdstanr)
+library(tidyverse)
+library(ggplot2)
+library(posterior)
+```
+
+## Introduction and Motivation
+
+Hierarchical models can be written in either a centered or non-centered form. In terms of getting a large number of useable posterior samples, the first is preferable in a situation where the individual random effects can be estimated well (and perhaps an unpooled model would be suitable) and the second is preferable in a situation where the individual effects cannot be estimated so well and we are more dependent on the hierarchical prior to pool information.
+
+The difficulty in hierarchical modeling is that beforehand it is unclear what exactly a precise or imprecise measurement is. It may even be that some parts of the model would be better parameterized one way or another.
+
+The scope of this technical report is to describe this phenomenon in the context of the 8-schools model, provide an alternative parameterization that avoids the issue, and then generalize it to a more complicated hierarchical model. These reparameterizations are inspired by those described in *Dynamically Rescaled Hamiltonian Monte Carlo for Bayesian Hierarchical Models*, by Tore Kleppe (2019).
+
+## Eight schools
+
+In the eight schools model, there are eight different schools doing test prep.
+
+```{r}
+N = 8
+```
+
+We are given estimates of mean effect of test prep in each of the eight schools along with a standard error of that estimate
+
+```{r}
+y = c(28,  8, -3,  7, -1,  1, 18, 12)
+sigma = c(15, 10, 16, 11,  9, 11, 10, 18)
+```
+
+The model itself is a basic multilevel model. Given the data, $y_i$ and $\sigma_i$, we must estimate the individual school effects, $\theta_i$, the average group level effect, $\mu$, and the group level standard deviation $\tau$.
+
+$$
+\tau \sim N^+(0, 10)\\
+\mu \sim N(0, 10)\\
+\theta_i \sim N(\mu, \tau)\\
+y_i \sim N(\theta_i, \sigma_i)
+$$
+In the centered parameterization, $\tau$, $\mu$, and $\theta_i$ are all sampled as parameters. Running this model in Stan with the default four chain 1000 draw configuration, it can be seen that the Rhat diagnostics for $\tau$ are suspiciously high and the effective sample size is very low.
+
+```{r, results = 'hide', message=FALSE, warning=FALSE}
+model = cmdstan_model("eight_schools_c.stan")
+fit = model$sample(data = list(N = N, y = y, sigma = sigma),
+                   num_cores = 4)
+```
+
+```{r, class.output='small'}
+fit$summary() %>% arrange(ess_bulk)
+```
+
+The high Rhat indicates the chains are not mixing well, though it is difficult to tell this from the posterior samples even if we know where to look (a plot of group level standard deviation $\tau$ vs. any of the individual random effects $\theta_i$).
+
+```{r, echo=FALSE, fig.align = "center"}
+fit$draws() %>%
+  as_draws_df() %>%
+  ggplot() +
+  geom_point(aes(`theta[1]`, log(tau)), size = 0.5) +
+  theme(text = element_text(size = 14)) +
+  facet_wrap(~ `.chain`)
+```
+
+The problem is more clearly illustrated with a comparison to the non-centered parameterization (which produces much better results for this problem). Instead of sampling $\theta_i$, a new parameter $z_i$ is introduced. By putting a unit normal prior on each $z_i$, the equivalent prior on $\theta_i$ can be achieved by defining it as a linear transformation of $z_i$:
+
+$$
+z_i \sim N(0, 1)\\
+\theta_i = \mu + \tau z_i
+$$
+
+```{r, results = 'hide', message=FALSE, warning=FALSE}
+model_nc = cmdstan_model("eight_schools_nc.stan")
+fit_nc = model_nc$sample(data = list(N = N, y = y, sigma = sigma),
+                   num_cores = 4)
+```
+
+```{r, class.output='small'}
+fit_nc$summary() %>% arrange(ess_bulk) %>% print(n = 10)
+```
+
+In the non-centered parameterization, the effective sample size is much higher and the Rhat diagnostics say that there is no indication that the chains are having trouble mixing. TA plot of the posterior draws of $\tau$ vs. one of the $\theta_i$ variables makes clear that the non-centered parameterization is exploring much more of parameter space.
+
+```{r, echo=FALSE, fig.align = "center"}
+bind_rows(fit$draws() %>% as_draws_df() %>% mutate(which = "centered"),
+          fit_nc$draws() %>% as_draws_df() %>% mutate(which = "non_centered")) %>%
+  ggplot() +
+  geom_point(aes(`theta[1]`, log(tau)), size = 0.5) +
+  facet_grid(~ which) +
+  theme(text = element_text(size = 14))
+```
+
+This plot is given in the centered parameterization. The funnel shape of the posterior is what makes the centered parameterization not work. What happens is that the curvature of the posterior is changing as a function of $\tau$. This change of curvature makes it difficult for the leapfrog integrator embedded in the No U-turn sampler in Stan to move around parameter space.
+
+The non-centered model is actually sampling on $\tau$, $z_i$, not $\tau$, $\theta_i$. Plotting the samples in these coordinates reveals why the non-centered parameterization is so effective:
+
+```{r, echo=FALSE, fig.align = "center"}
+fit_nc$draws() %>% as_draws_df() %>%
+  ggplot() +
+  geom_point(aes(`z[1]`, log(tau)), size = 0.5) +
+  theme(text = element_text(size = 14))
+```
+
+This sort of roughly Gaussian (constant curvature) posterior is easy for the sampler to adapt to.
+
+## Problems with non-centered parameterization
+
+What is interesting is that this situation can be reversed by assuming that our estimates of the school effects are actually very high precision (making the standard error inputs very small).
+
+```{r}
+sigma_small = c(0.15, 0.10, 0.16, 0.11, 0.09, 0.11, 0.10, 0.18)
+```
+
+```{r, include = FALSE, results = 'hide', message=FALSE, warning=FALSE}
+fit = model$sample(data = list(N = N, y = y, sigma = sigma_small),
+                   num_cores = 4)
+fit_nc = model_nc$sample(data = list(N = N, y = y, sigma = sigma_small),
+                         num_cores = 4)
+```
+
+With the smaller standard error the centered parameterization performs really well
+
+```{r, echo = FALSE, class.output='small'}
+fit$summary() %>% arrange(ess_bulk) %>% print(n = 3)
+```
+
+and the non-centered parameterization performs really badly.
+
+```{r, echo = FALSE, class.output='small'}
+fit_nc$summary() %>% arrange(ess_bulk) %>% print(n = 3)
+```
+
+The issue can be seen with a plot of a $z_i$ against the group mean parameter.
+
+```{r, echo=FALSE, fig.align = "center"}
+fit_nc$draws() %>% as_draws_df() %>%
+  ggplot() +
+  geom_point(aes(`z[3]`, mu), size = 0.5) +
+  theme(text = element_text(size = 14))
+```
+
+The effect is easier to see by repeating this experiment for various standard errors and recording the lowest effective sample size in the model. There is a quick transition between when the centered or non-centered parameterization should be preferred.
+
+```{r, echo = FALSE, fig.align = "center", message=FALSE, warning=FALSE}
+perfdf = read_csv("eight_schools_perf_df.csv")
+
+perfdf %>%
+  rename(Method = method) %>%
+  filter(Method != "kleppe") %>%
+  ggplot(aes(scale, min_ess)) +
+  geom_point(aes(color = Method)) +
+  geom_line(aes(color = Method)) +
+  xlab("Measurement error scale (small error left, big error right, default 1.0)") +
+  ylab("Lowest effective sample size in model") +
+  scale_x_log10() +
+  theme(text = element_text(size = 14))
+```
+
+## What to do?
+
+The clue to what to do comes from looking at the posterior of $\theta$ in the situation where the standard errors are low. In this case, the posterior estimates of the effect match those of the individual estimates that were provided as data.
+
+```{r, echo = FALSE, class.output = "small"}
+fit$draws() %>% as_draws_df %>%
+  select(starts_with("theta")) %>%
+  gather(parameter, value) %>%
+  group_by(parameter) %>%
+  summarize(mean = mean(value),
+            sd = sd(value))
+```
+
+```{r}
+y = c(28,  8, -3,  7, -1,  1, 18, 12)
+sigma_small = c(0.15, 0.10, 0.16, 0.11, 0.09, 0.11, 0.10, 0.18)
+```
+
+Because the data is very informative, the likelihood more or less determines the posterior and the hierarchical prior has little effect.
+
+This means that the curvature is determined by the likelihood term. When the data in informative, the posterior curvature is mostly determined by the likelihood, and when it is not so informative, the curvature is informed by the hierarchical prior. The question is how to do a reparameterization that is sensitive to both?
+
+We'll first change how the priors are defined on $\theta_i$. In the non-centered parameterization they are specified on an underlying parameters $z_i$, but the only reason that works is because the linear transformation we use just so happens to put the right priors on $\theta_i$.
+
+If we are going to change that transformation, we need to put actual priors on $\theta_i$. This can be done with a change of parameters formula:
+
+$$
+p(z_i) = p_{\theta_i}(f^{-1}(z_i)) \left| \frac{\partial f^{-1}(z_i)}{\partial z_i} \right|\\
+$$
+
+In this way the log density of the sampled parameter ($z_i$) can be written in terms of the modeling parameter ($\theta_i$). The model can now be expressed:
+
+$$
+\theta_i = f^{-1}(z_i) = b_i + a_i z_i\\
+\theta_i \sim N(\mu, \tau)
+$$
+with an additional $\sum_i\log(a_i)$ added to the log density.
+
+When the data is non-informative, we chose the non-centered parameterization ($b_i= \mu$ and $a_i = \tau$). When the data is informative, we know the posterior on $\theta_i$ will be close to $N(y_i, \sigma_i)$, so if we chose $b_i = y_i$ and $a_i = \sigma_i$, $z_i$ would be roughly a unit normal at zero (which is very easy for Stan to work with). The question is what linear transformation makes sense in both cases?
+
+If we condition on $\tau$ being fixed, we have a normal-normal model where we are estimating the mean. In this case we would expect the transformation:
+
+$$
+b_i = \left( \frac{1}{\tau^2} + \frac{1}{\sigma_i^2}\right)^{-1} \left( \frac{\mu}{\tau^2} + \frac{y_i}{\sigma_i^2}\right)\\
+a_i = \left( \frac{1}{\tau^2} + \frac{1}{\sigma_i^2}\right)^{-\frac{1}{2}}
+$$
+to ensure that $z_i$ is roughly $N(0, 1)$. The solution now is to use this transformation even if $\tau$ isn't fixed. This remains a perfectly valid reparameterization of the model (though we must remember to always add the extra $\sum_i\log(a_i)$ term to the log density for the Jacobian.
+
+Repeating the experiments above, this reparameterization works much better:
+
+```{r, echo = FALSE, fig.align = "center", message=FALSE, warning=FALSE}
+perfdf = read_csv("eight_schools_perf_df.csv")
+
+perfdf %>%
+  rename(Method = method) %>%
+  ggplot(aes(scale, min_ess)) +
+  geom_point(aes(color = Method)) +
+  geom_line(aes(color = Method)) +
+  xlab("Measurement error scale (small error left, big error right, default 1.0)") +
+  ylab("Lowest effective sample size in model") +
+  scale_x_log10() +
+  theme(text = element_text(size = 14))
+```
+
+This isn't strictly following the rules outlined in *Dynamically Rescaled Hamiltonian Monte Carlo for Bayesian Hierarchical Models* (Kleppe, 2019), but I think it's in the same spirit.
+
+# A similar method for hierarchical GLMs
+
+The same tradeoff between centered and non-centered happens for more complicated hierarchical regressions as well. The non-centered parameterization is preferred by default because hierarchical modeling is most useful when individual effects are not clear (and so pooling regularizes the estimates). However, it is totally possible to use a hierarchical model in a situation where the likelihood totally trounces the prior, or, more deviously, in a situation where the some parameters are highly informed by the data and some are not.
+
+In this situation, we can do something similar to what we did above.
+
+1. Fix the group level variances
+2. Compute a normal approximation to the posterior of all the fixed and random effects (MAP estimate for mean + Laplace approximation for covariance)
+3. Don't sample in a space of the actual fixed/random effects, but use a linear transform from the normal approximation in the previous step (and don't forget the Jacobian adjustment!)
+
+More explicitly, for regression parameters $\alpha$, if the mode of the map estimate of alpha is $\mu$, the posterior covariance estimate is $\Sigma$, the prior mean is $0$ and the prior covariance with fixed group level variances is $\Sigma_0$, then the reparameterization can be written:
+
+$$
+LL^{T} = \left( \Sigma^{-1} + \Sigma_0^{-1} \right)^{-1}\\
+b = \left( \Sigma^{-1} + \Sigma_0^{-1} \right)^{-1}\left( \Sigma^{-1} \mu \right)\\
+\alpha = b + L^{-1}z
+$$
+with an extra $-\log|L|$ added to the posterior. In this way, similarly to the eight schools problem, the sampler works on $z$ but the prior is specified on $\alpha$.
+
+## Example
+
+We'll work this out for a hierarchical regression with a binomial output, two groups (one of size four and one of size ten), and an intercept term.
+
+$$
+\sigma_1 \sim N(0, 1)\\
+\sigma_2 \sim N(0, 1)\\
+\alpha_0 \sim N(0, 1)\\
+\alpha_{1, i} \sim N(0, \sigma_1)\\
+\alpha_{2, j} \sim N(0, \sigma_2)\\
+y_{ij} \sim \text{binomial}(N_{ij}, \text{logit}^{-1}(\alpha_{1, i} + \alpha_{2, j} + \alpha_0))
+$$
+
+The data in this case are $y_{ij}$ and $N_{ij}$. Everything else is a parameter and must be estimated. In eight schools, the informativeness of the measurements was defined in terms of the standard errors. Because these are binomials, this will be reflected in the number of trials. Very informative data looks like:
+
+```
+$Nj
+     [,1] [,2] [,3] [,4] [,5] [,6] [,7] [,8] [,9] [,10]
+[1,]  857 1743 1156  152 2418   21  970   68  205  1257
+[2,]  885   77 1534 1993  456  545 1814 1907 2304   301
+[3,]  525 2017 1656   55  400  356 1301 1377  113  1644
+[4,] 1007 1195  184 1404 1366  865 1740  930 1020   942
+
+$y
+     [,1] [,2] [,3] [,4] [,5] [,6] [,7] [,8] [,9] [,10]
+[1,]  429  934  549   82 1143   13  454   33   99   579
+[2,]  559   52  937 1161  275  383 1068 1170 1496   184
+[3,]  252 1072  796   26  190  188  588  656   59   694
+[4,]  674  813  123  862  838  606 1062  588  708   579
+```
+
+and uninformative data looks like:
+
+```
+$Nj
+     [,1] [,2] [,3] [,4] [,5] [,6] [,7] [,8] [,9] [,10]
+[1,]    0    2    0    2    3    2    2    2    4     0
+[2,]    1    1    0    2    0    1    2    1    1     2
+[3,]    0    1    3    1    0    1    1    1    1     0
+[4,]    1    1    1    0    2    2    0    3    0     1
+
+$y
+     [,1] [,2] [,3] [,4] [,5] [,6] [,7] [,8] [,9] [,10]
+[1,]    0    1    0    1    3    2    0    1    1     0
+[2,]    1    1    0    2    0    1    1    0    1     2
+[3,]    0    1    3    0    0    0    0    0    1     0
+[4,]    1    1    1    0    1    1    0    2    0     0
+```
+
+We don't have an easy standard error parameter to control the precision of the data, but the standard error for MLE estimate of the success probability for a binomial is $\sqrt{\frac{p_{ij} (1 - p_{ij})}{N_{ij}}}$. So to generate the data, given $\alpha_0$, $\alpha_{1, i}$, and $\alpha_{2, j}$ we can compute $p_{ij}$, and then given a target standard error we can compute what $N_{ij}$ needs to be, and then we can sample a $y_{ij}$.
+
+First of all, we need values for the hyperparameters:
+```{r}
+J1 = 4
+J2 = 10
+
+sd1 = 0.3
+sd2 = 0.15
+
+alpha1 = rnorm(J1, 0, sd1)
+alpha2 = rnorm(J2, 0, sd2)
+```
+
+Then it is a matter of picking a standard error for every cell. For the purposes of making a plot with performance on the y-axis and vaguely precision on the x-axis, we could make the x-axis exactly the standard error of the data. What this means though is that all groups will have about the same amount of data.
+
+To make the problem a little more interesting, we'd like to sample the standard errors from a distribution that slides from high precision, to a mix of high and low precision, to low precision data. To do this, imagine a scale, 0.0 to 1.0 that maps from the lowest standard error we want to deal with (most precise data) to the highest standard error we want to deal with (least precise). If we sample from beta distribution that slides along this scale, we can achieve the desired effect. Vaguely this sequence of beta distributions might look like:
+
+```{r}
+x = seq(0, 1, length = 100)
+
+tibble(x = x) %>%
+  ggplot(aes(x)) +
+  stat_function(fun = dbeta, args = list(shape1 = 9, shape2 = 1), color = "darkorange4") +
+  stat_function(fun = dbeta, args = list(shape1 = 6.0625, shape2 = 1.5625), color = "darkorange3") +
+  stat_function(fun = dbeta, args = list(shape1 = 3.25, shape2 = 3.25), color = "darkorange2") +
+  stat_function(fun = dbeta, args = list(shape1 = 1.5625, shape2 = 6.0625), color = "darkorange1") +
+  stat_function(fun = dbeta, args = list(shape1 = 1, shape2 = 9), color = "darkorange") +
+  ggtitle("Sequence of beta functions")
+```
+
+Here is a function that does this on the log scale parameterized by ```n```, the number of standard errors to compute, ```x```, the position along the 0.0 to 1.0 scale, ```sel```, the lowest standard error, and ```seh```, the highest standard error:
+
+```{r}
+rse = function(n, x, sel, seh) {
+  logx = rep(0, n)
+  
+  logx = rbeta(n, 9 * x^2 + 1, 9 * abs((x - 1.0)^2) + 1)
+
+  exp(log(sel) + logx * (log(seh) - log(sel)))
+}
+```
+
+With standard errors and true parameter values in place, it's possible to generate datasets.
+
+```{r}
+generate_data = function(x, sel, seh) {
+  se = matrix(rse(J1 * J2, x, sel, seh), nrow = J1)
+  
+  p = array(0, dim = c(J1, J2))
+  Nj = array(0, dim = c(J1, J2))
+  y = array(0, dim = c(J1, J2))
+  for(i in 1:J1) {
+    for(j in 1:J2) {
+      p[i, j] = inv_logit(intercept + alpha1[i] + alpha2[j])
+      Nj[i, j] = ceiling(p[i, j] * (1 - p[i, j]) / se[i, j]^2)
+      y[i, j] = rbinom(1, Nj[i, j], p[i, j])
+    }
+  }
+  
+  return(list(Nj = Nj, y = y, p = round(p, 2), se = round(se, 5)))
+}
+```
+
+The high precision and low precision examples above came from this process. An example of a mixed-precision dataset is:
+
+We can generate a dataset and run the model easily enough for the centered and non-centered parameterizations:
+
+We can easily run this model for a given dataset 
+
+```{r}
+models = stan_model("regression_fixed_group_sd.stan")
+o = optimizing(models, data = data_fix_sds(1.0, 1.0), hessian = TRUE)
+
+modelc = cmdstan_model("regression_c.stan", quiet = FALSE)
+modeln = cmdstan_model("regression_nc.stan", quiet = FALSE)
+modelk = cmdstan_model("regression_kleppe.stan", quiet = FALSE)
+
+fitc = modelc$sample(data = data_est, metric = "dense_e", num_cores = 4)
+fitn = modeln$sample(data = list(J1 = J1, J2 = J2, N = Nj, y = y), metric = "dense_e", num_cores = 4)
+fitk = modelk$sample(data = list(J1 = J1, J2 = J2, N = Nj, y = y,
+                                 intercept_mu = o$par[1],
+                                 alpha1_mu = o$par[2:(1 + J1)],
+                                 alpha2_mu = o$par[(2 + J1):(1 + J1 + J2)],
+                                 L = t(chol(-o$hessian))), metric = "dense_e", num_cores = 4)
+```
